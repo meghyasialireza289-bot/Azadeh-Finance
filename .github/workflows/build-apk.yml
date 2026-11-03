@@ -1,0 +1,178 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Prepare project files
+        run: |
+          set -e
+          ls -la
+          test -f index.html || { echo "ERROR: index.html not found in repo root"; exit 1; }
+          test -f icon.png || { echo "ERROR: icon.png not found in repo root"; exit 1; }
+          pip install pillow
+          mkdir -p www android-res
+
+          cat > package.json <<'EOF'
+          {
+            "name": "azadeh-finance-app",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/android": "^7.0.0",
+              "@capacitor/cli": "^7.0.0",
+              "@capacitor/core": "^7.0.0",
+              "@capacitor/filesystem": "^7.0.0",
+              "@capacitor/share": "^7.0.0",
+              "@capacitor/splash-screen": "^7.0.0"
+            }
+          }
+          EOF
+
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.azadeh.financemanager",
+            "appName": "مدیر مالی آزاده",
+            "webDir": "www",
+            "backgroundColor": "#16000a",
+            "plugins": {
+              "SplashScreen": {
+                "launchShowDuration": 1200,
+                "launchAutoHide": true,
+                "backgroundColor": "#000000",
+                "androidScaleType": "CENTER_CROP",
+                "showSpinner": false,
+                "splashFullScreen": true,
+                "splashImmersive": true
+              }
+            }
+          }
+          EOF
+
+          cat > www/manifest.webmanifest <<'EOF'
+          {
+            "name": "مدیر مالی آزاده",
+            "short_name": "مالی آزاده",
+            "lang": "fa",
+            "dir": "rtl",
+            "start_url": "index.html",
+            "display": "standalone",
+            "background_color": "#16000a",
+            "theme_color": "#7a0a16",
+            "icons": [
+              {"src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+              {"src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+            ]
+          }
+          EOF
+
+          cat > www/app-bridge.js <<'EOF'
+          (function () {
+            var C = window.Capacitor;
+            if (!C || !C.isNativePlatform || !C.isNativePlatform()) return;
+            function toBase64(bytes) {
+              var s = '', chunk = 0x8000;
+              for (var i = 0; i < bytes.length; i += chunk) s += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+              return btoa(s);
+            }
+            async function asBytes(data) {
+              if (typeof data === 'string') return new TextEncoder().encode(data);
+              if (data instanceof Blob) return new Uint8Array(await data.arrayBuffer());
+              if (data instanceof ArrayBuffer) return new Uint8Array(data);
+              if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+              return new TextEncoder().encode(String(data));
+            }
+            window.claude = window.claude || {};
+            var prev = window.claude.use;
+            window.claude.use = async function (name) {
+              if (name !== 'downloads') return prev ? prev.apply(this, arguments) : null;
+              return {
+                save: async function (opts) {
+                  try {
+                    var P = C.Plugins, bytes = await asBytes(opts.data);
+                    var r = await P.Filesystem.writeFile({ path: opts.filename, data: toBase64(bytes), directory: 'CACHE', recursive: true });
+                    await P.Share.share({ title: opts.filename, url: r.uri, dialogTitle: 'ذخیره / اشتراک‌گذاری فایل' });
+                  } catch (e) {
+                    if (e && /cancel/i.test(String(e.message || e))) { var d = new Error('declined'); d.code = 'declined'; throw d; }
+                    throw e;
+                  }
+                }
+              };
+            };
+          })();
+          EOF
+
+          python3 - <<'EOF'
+          from PIL import Image, ImageDraw
+          import os
+          im = Image.open('icon.png').convert('RGB')
+          def rs(n): return im.resize((n, n), Image.LANCZOS)
+          rs(192).save('www/icon-192.png'); rs(512).save('www/icon-512.png')
+          dens = {'mdpi': (48, 108), 'hdpi': (72, 162), 'xhdpi': (96, 216), 'xxhdpi': (144, 324), 'xxxhdpi': (192, 432)}
+          for d, (leg, ad) in dens.items():
+              out = 'android-res/mipmap-' + d
+              os.makedirs(out, exist_ok=True)
+              rs(leg).save(out + '/ic_launcher.png')
+              big = rs(leg * 4)
+              m = Image.new('L', (leg * 4, leg * 4), 0)
+              ImageDraw.Draw(m).ellipse((0, 0, leg * 4 - 1, leg * 4 - 1), fill=255)
+              r = Image.new('RGBA', (leg * 4, leg * 4), (0, 0, 0, 0))
+              r.paste(big, (0, 0), m)
+              r.resize((leg, leg), Image.LANCZOS).save(out + '/ic_launcher_round.png')
+              rs(ad).save(out + '/ic_launcher_foreground.png')
+              rs(ad).save(out + '/ic_launcher_background.png')
+          os.makedirs('android-res/mipmap-anydpi-v26', exist_ok=True)
+          xml = '<?xml version="1.0" encoding="utf-8"?>\n<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n    <background android:drawable="@mipmap/ic_launcher_background"/>\n    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>\n</adaptive-icon>\n'
+          for n in ('ic_launcher', 'ic_launcher_round'):
+              open('android-res/mipmap-anydpi-v26/' + n + '.xml', 'w').write(xml)
+          os.makedirs('android-res/drawable', exist_ok=True)
+          im.resize((1080, 1080), Image.LANCZOS).save('android-res/drawable/splash.png')
+          s = open('index.html', encoding='utf-8').read()
+          if 'app-bridge.js' not in s:
+              s = s.replace('<meta charset="UTF-8">', '<meta charset="UTF-8">\n<script src="app-bridge.js"></script>', 1)
+          open('www/index.html', 'w', encoding='utf-8').write(s)
+          print('prepared')
+          EOF
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Apply icon and splash
+        run: |
+          RES=android/app/src/main/res
+          rm -rf $RES/mipmap-* $RES/drawable-port-* $RES/drawable-land-* $RES/drawable/splash.png
+          cp -r android-res/* $RES/
+
+      - name: Sync web assets
+        run: npx cap sync android
+
+      - name: Build APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: azadeh-finance-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
